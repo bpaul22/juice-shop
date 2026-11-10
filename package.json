@@ -192,7 +192,9 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.57.1"
   },
-  "engines": {
+      "overrides": {
+       "crypto-js": "^4.2.0"
+     }, "engines": {
     "node": "22 - 26"
   },
   "os": [
