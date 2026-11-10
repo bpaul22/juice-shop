@@ -69,6 +69,8 @@ jobs:
 
   signature:
     runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.digest.outputs.ref }}
     permissions:
       contents: read
       packages: write
@@ -113,3 +115,125 @@ jobs:
 
       - name: Verifier l'attestation du SBOM
         run: cosign verify-attestation "${{ steps.digest.outputs.ref }}" --type cyclonedx --certificate-identity-regexp "https://github.com/bpaul22/juice-shop/.*" --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+  kyverno:
+    runs-on: ubuntu-latest
+    needs: signature
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Creer le cluster kind
+        run: kind create cluster --name devsecops
+
+      - name: Installer Kyverno
+        run: |
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update
+          helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+          kubectl wait --for=condition=Available deployment --all -n kyverno --timeout=300s
+
+      - name: Appliquer les 3 politiques Kyverno
+        run: |
+          kubectl apply -f kyverno/politiques.yaml
+          kubectl wait --for=condition=Ready clusterpolicy --all --timeout=180s
+          kubectl get clusterpolicy
+
+      - name: Test 1 - image non signee (refus attendu)
+        run: |
+          if OUT=$(kubectl run test-non-signee --image=nginx:1.27 --restart=Never 2>&1); then
+            echo "$OUT"; echo "ERREUR : une image non signee aurait du etre refusee"; exit 1
+          else
+            echo "REFUS CONFIRME :"; echo "$OUT"
+          fi
+
+      - name: Test 2 - tag latest (refus attendu)
+        run: |
+          if OUT=$(kubectl run test-latest --image=nginx:latest --restart=Never 2>&1); then
+            echo "$OUT"; echo "ERREUR : le tag latest aurait du etre refuse"; exit 1
+          else
+            echo "REFUS CONFIRME :"; echo "$OUT"
+          fi
+
+      - name: Test 3 - conteneur en root (refus attendu)
+        run: |
+          cat > pod-root.yaml <<EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-root
+          spec:
+            containers:
+              - name: juiceshop
+                image: ${{ needs.signature.outputs.ref }}
+          EOF
+          if OUT=$(kubectl apply -f pod-root.yaml 2>&1); then
+            echo "$OUT"; echo "ERREUR : un conteneur en root aurait du etre refuse"; exit 1
+          else
+            echo "REFUS CONFIRME :"; echo "$OUT"
+          fi
+
+      - name: Test 4 - image signee et conforme (acceptation attendue)
+        run: |
+          cat > pod-conforme.yaml <<EOF
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: juiceshop-conforme
+          spec:
+            containers:
+              - name: juiceshop
+                image: ${{ needs.signature.outputs.ref }}
+                securityContext:
+                  runAsNonRoot: true
+          EOF
+          kubectl apply -f pod-conforme.yaml
+          kubectl get pod juiceshop-conforme
+
+  zap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Construire l'image de l'application
+        run: docker build -t juiceshop:zap .
+
+      - name: Demarrer l'application
+        run: |
+          docker run -d --name juiceshop -p 3000:3000 juiceshop:zap
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000 > /dev/null; then echo "Application prete"; break; fi
+            echo "Attente de l'application ($i)..."; sleep 5
+          done
+
+      - name: OWASP ZAP baseline
+        run: |
+          mkdir zap-out && chmod 777 zap-out
+          docker run --rm --network host -v $PWD/zap-out:/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://localhost:3000 -r zap.html -J zap.json -I
+
+      - name: Resume des alertes ZAP
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, collections
+          d = json.load(open('zap-out/zap.json'))
+          c = collections.Counter()
+          for site in d.get('site', []):
+              for a in site.get('alerts', []):
+                  c[a.get('riskdesc', '?').split(' ')[0]] += 1
+          texte = "Alertes ZAP : " + ", ".join(k + " = " + str(v) for k, v in sorted(c.items()))
+          print(texte)
+          open('resume-zap.txt', 'w').write(texte + "\n")
+          PY
+          cat resume-zap.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sauvegarder les rapports ZAP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-rapport-${{ github.run_number }}
+          path: |
+            zap-out/zap.html
+            zap-out/zap.json
+            resume-zap.txt
