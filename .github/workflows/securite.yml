@@ -135,7 +135,13 @@ jobs:
 
       - name: Appliquer les 3 politiques Kyverno
         run: |
-          kubectl apply -f kyverno/politiques.yaml
+          ok=0
+          for i in $(seq 1 10); do
+            if kubectl apply -f kyverno/politiques.yaml; then ok=1; break; fi
+            echo "Le webhook Kyverno n'est pas encore pret, nouvel essai ($i/10) dans 15 s..."
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then echo "Impossible d'appliquer les politiques"; exit 1; fi
           kubectl wait --for=condition=Ready clusterpolicy --all --timeout=180s
           kubectl get clusterpolicy
 
