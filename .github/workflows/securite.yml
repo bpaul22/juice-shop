@@ -15,3 +15,54 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Semgrep (analyse du code)
+        run: semgrep scan --config p/owasp-top-ten --sarif --output semgrep.sarif
+
+      - name: Sauvegarder le rapport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+
+  artefact:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Hadolint (controle du Dockerfile)
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 /bin/hadolint --failure-threshold error - < Dockerfile
+
+      - name: Construire l'image
+        run: docker build -t juiceshop:1.0.0 .
+
+      - name: Trivy image (rapport SARIF)
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $PWD:/work aquasec/trivy:0.57.1 image --format sarif --output /work/trivy-image.sarif juiceshop:1.0.0
+
+      - name: Trivy config (Dockerfile et manifestes)
+        run: docker run --rm -v $PWD:/work aquasec/trivy:0.57.1 config --severity HIGH,CRITICAL /work
+
+      - name: Syft (SBOM CycloneDX)
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $PWD:/work anchore/syft:v1.18.1 juiceshop:1.0.0 -o cyclonedx-json=/work/sbom.cdx.json
+
+      - name: Sauvegarder les rapports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapports-artefact
+          path: |
+            trivy-image.sarif
+            sbom.cdx.json
+
+      - name: Trivy image (seuil bloquant CRITICAL)
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image --severity CRITICAL --ignore-unfixed --exit-code 1 juiceshop:1.0.0
