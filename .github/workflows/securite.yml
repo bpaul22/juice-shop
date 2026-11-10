@@ -66,3 +66,50 @@ jobs:
 
       - name: Trivy image (seuil bloquant CRITICAL)
         run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image --severity CRITICAL --ignore-unfixed --exit-code 1 juiceshop:1.0.0
+
+  signature:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/bpaul22/juice-shop:1.0.0
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Connexion au registre GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Construire et pousser l'image
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Recuperer le digest de l'image
+        id: digest
+        run: |
+          REF=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Image referencee par digest : $REF"
+
+      - name: Generer le SBOM
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $PWD:/work anchore/syft:v1.18.1 "$IMAGE" -o cyclonedx-json=/work/sbom.cdx.json
+
+      - name: Signer l'image (Cosign sans cle)
+        run: cosign sign --yes "${{ steps.digest.outputs.ref }}"
+
+      - name: Attacher le SBOM en attestation
+        run: cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "${{ steps.digest.outputs.ref }}"
+
+      - name: Verifier la signature
+        run: cosign verify "${{ steps.digest.outputs.ref }}" --certificate-identity-regexp "https://github.com/bpaul22/juice-shop/.*" --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+      - name: Verifier l'attestation du SBOM
+        run: cosign verify-attestation "${{ steps.digest.outputs.ref }}" --type cyclonedx --certificate-identity-regexp "https://github.com/bpaul22/juice-shop/.*" --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
